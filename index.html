@@ -3865,5 +3865,334 @@ function doLogin(id){
 })();
 </script>
 
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   v6.0 — ISOLATED CLOUD RECORDS + EMPLOYEE PAY REGISTER
+   - เก็บรายการแยกเอกสาร ลดการทับกันเมื่อหลายเครื่องบันทึกพร้อมกัน
+   - ไม่ส่งข้อมูล local ขึ้น Cloud จนกว่าจะอ่าน snapshot แรกเสร็จ
+   - ทะเบียนพนักงานแยกจาก users และบันทึกค่าจ้างพื้นฐานรายคน
+   ═══════════════════════════════════════════════════════════════════ */
+(function(){
+  'use strict';
+  if(typeof db==='undefined')return;
+  var v6CloudAvailable=typeof fdb!=='undefined'&&!!fdb;
+
+  var V6_ARRAYS=[
+    'users','accounts','customers','products','moves','sales','pays','inc','exp',
+    'money','counts','recon','audit','lots','comms','compays','ar','arpays',
+    'deposits','formulaSheets','suppliers','supplierQuotes','scorecards',
+    'employees','partners','consB','cons','targets','tiers','zones'
+  ];
+  var v6Ref=v6CloudAvailable?fdb.collection('company').doc(COMPANY_ID).collection('records'):null;
+  var v6Unsub=null,v6Timer=null,v6Ready=false,v6Starting=false;
+  var v6Shadow={},v6Docs={};
+
+  function v6Clone(x){try{return JSON.parse(JSON.stringify(x))}catch(e){return x}}
+  function v6Json(x){try{return JSON.stringify(x)}catch(e){return String(x)}}
+  function v6Key(kind,id){
+    return encodeURIComponent(kind+'|'+String(id)).replace(/%/g,'_');
+  }
+  function v6Entries(source){
+    var out={},i,j,a,id;
+    source=source||{};
+    V6_ARRAYS.forEach(function(kind){
+      a=Array.isArray(source[kind])?source[kind]:[];
+      for(j=0;j<a.length;j++){
+        id=a[j]&&a[j].id!==undefined?String(a[j].id):String(j);
+        out[v6Key(kind,id)]={kind:kind,rid:id,data:v6Clone(a[j])};
+      }
+    });
+    out[v6Key('_meta','cfg')]={kind:'_meta',rid:'cfg',data:v6Clone(source.cfg||{})};
+    out[v6Key('_meta','ctr')]={kind:'_meta',rid:'ctr',data:v6Clone(source.ctr||{})};
+    return out;
+  }
+  function v6Map(entries){
+    var m={};Object.keys(entries||{}).forEach(function(k){
+      m[k]=v6Json(entries[k].data);
+    });return m;
+  }
+  function v6Dirty(local){
+    var e=v6Entries(local),d={};
+    Object.keys(e).forEach(function(k){
+      if(v6Shadow[k]!==v6Json(e[k].data))d[k]=e[k];
+    });
+    Object.keys(v6Shadow).forEach(function(k){
+      if(!e[k])d[k]={deleted:true};
+    });
+    return d;
+  }
+  function v6SetInDb(target,entry){
+    if(!entry||entry.deleted)return;
+    if(entry.kind==='_meta'){target[entry.rid]=v6Clone(entry.data);return}
+    if(!Array.isArray(target[entry.kind]))target[entry.kind]=[];
+    var a=target[entry.kind],i=-1;
+    for(var j=0;j<a.length;j++){
+      if(String(a[j]&&a[j].id)!==String(entry.rid))continue;
+      i=j;break;
+    }
+    if(i<0)a.push(v6Clone(entry.data));else a[i]=v6Clone(entry.data);
+  }
+  function v6DeleteInDb(target,key){
+    var raw=decodeURIComponent(String(key).replace(/_/g,'%'));
+    var p=raw.split('|'),kind=p[0],rid=p.slice(1).join('|');
+    if(kind==='_meta')return;
+    if(!Array.isArray(target[kind]))return;
+    target[kind]=target[kind].filter(function(x){return String(x&&x.id)!==String(rid)});
+  }
+  function v6DbFromDocs(docs,base){
+    var next=v6Clone(base||{}),seen={};
+    V6_ARRAYS.forEach(function(k){next[k]=[]});
+    Object.keys(docs||{}).forEach(function(k){
+      var e=docs[k];if(!e||e.deleted)return;
+      seen[k]=1;v6SetInDb(next,e);
+    });
+    if(!next.cfg)next.cfg={expWarn:7,dueWarn:3};
+    if(!next.ctr)next.ctr={};
+    return next;
+  }
+  function v6BatchWrite(changes){
+    var keys=Object.keys(changes||{}),prom=[],i;
+    for(i=0;i<keys.length;i+=450){
+      var batch=fdb.batch(),part=keys.slice(i,i+450);
+      part.forEach(function(k){
+        var ref=v6Ref.doc(k),e=changes[k];
+        if(e&&e.deleted)batch.set(ref,{deleted:true,kind:'_tombstone',rid:k,
+          updatedAt:firebase.firestore.FieldValue.serverTimestamp(),
+          updatedBy:me?me.name:'unknown',deviceId:getDeviceId()});
+        else batch.set(ref,{deleted:false,kind:e.kind,rid:e.rid,data:e.data,
+          updatedAt:firebase.firestore.FieldValue.serverTimestamp(),
+          updatedBy:me?me.name:'unknown',deviceId:getDeviceId()});
+      });
+      prom.push(batch.commit());
+    }
+    return Promise.all(prom);
+  }
+  function v6MarkReady(){
+    v6Ready=true;v6Starting=false;cloudFirstSync=true;
+    try{syncBadge('on')}catch(e){}
+    try{
+      if(typeof migrate==='function')migrate();
+      ST.s(KEY,JSON.stringify(db));
+      v6Save();
+      if($('app')&&!$('app').classList.contains('hide'))render();
+      else if($('login')&&!$('login').classList.contains('hide')&&typeof showLogin==='function')showLogin();
+    }catch(e){}
+  }
+  function v6ApplySnapshot(snap,initial){
+    var docs={},i,doc;
+    snap.forEach(function(d){
+      var x=d.data()||{};
+      docs[d.id]={kind:x.kind,rid:x.rid,data:x.data,deleted:x.deleted===true};
+    });
+    var localEntries=v6Entries(db),dirty=v6Dirty(db);
+    var next=v6DbFromDocs(docs,db);
+    if(!initial){
+      Object.keys(dirty).forEach(function(k){
+        if(dirty[k]&&dirty[k].deleted)v6DeleteInDb(next,k);
+        else v6SetInDb(next,dirty[k]);
+      });
+    }
+    isRemoteUpdate=true;db=next;
+    if(typeof migrate==='function')migrate();
+    isRemoteUpdate=false;
+    v6Docs=docs;
+    v6Shadow=v6Map(docs);
+    Object.keys(dirty).forEach(function(k){
+      if(dirty[k]&&dirty[k].deleted)delete v6Shadow[k];
+      else if(dirty[k])v6Shadow[k]=v6Json(dirty[k].data);
+    });
+    ST.s(KEY,JSON.stringify(db));
+    if(initial||Object.keys(dirty).length){
+      try{render()}catch(e){}
+    }
+  }
+  function v6Start(){
+    if(!FIREBASE_ENABLED||!v6CloudAvailable||v6Starting)return;
+    v6Starting=true;v6Ready=false;cloudFirstSync=false;
+    if(v6Unsub){v6Unsub();v6Unsub=null}
+    try{if(cloudUnsub)cloudUnsub()}catch(e){}
+    syncBadge('wait');
+    var metaRef=fdb.collection('company').doc(COMPANY_ID);
+    Promise.all([v6Ref.get(),metaRef.get()]).then(function(parts){
+      var snap=parts[0],meta=parts[1],legacy=null;
+      if(meta.exists){
+        try{legacy=JSON.parse(meta.data().data||'null')}catch(e){legacy=null}
+      }
+      if(!snap.empty){
+        v6ApplySnapshot(snap,true);v6MarkReady();
+      }else if(legacy&&legacy.products&&legacy.users){
+        var localScore=(db.sales||[]).length*100+(db.moves||[]).length*10+(db.audit||[]).length;
+        var remoteScore=(legacy.sales||[]).length*100+(legacy.moves||[]).length*10+(legacy.audit||[]).length;
+        if(localScore>remoteScore){
+          var localAll=v6Entries(db);v6Docs=localAll;v6Shadow={};
+          v6BatchWrite(localAll).then(function(){
+            v6Shadow=v6Map(localAll);v6MarkReady();
+          }).catch(function(){v6MarkReady()});
+        }else{
+          isRemoteUpdate=true;db=legacy;
+          if(typeof migrate==='function')migrate();
+          isRemoteUpdate=false;
+          var remoteAll=v6Entries(db);v6Docs=remoteAll;v6Shadow=v6Map(remoteAll);
+          v6BatchWrite(remoteAll).then(function(){v6MarkReady()}).catch(function(){v6MarkReady()});
+        }
+      }else{
+        var local=v6Entries(db);
+        v6Docs=local;v6Shadow={};
+        v6BatchWrite(local).then(function(){
+          v6Shadow=v6Map(local);v6MarkReady();
+        }).catch(function(){v6MarkReady()});
+      }
+      v6Unsub=v6Ref.onSnapshot(function(s){
+        if(!v6Ready)return;
+        v6ApplySnapshot(s,false);
+      },function(){syncBadge('off')});
+    }).catch(function(){
+      v6Starting=false;v6Ready=false;syncBadge('off');
+      try{toast('⚠️ โหลด Cloud ไม่สำเร็จ — ตรวจสอบสิทธิ์ Firestore','a')}catch(e){}
+    });
+  }
+  function v6Stop(){
+    if(v6Unsub){v6Unsub();v6Unsub=null}
+    if(cloudUnsub){cloudUnsub();cloudUnsub=null}
+    v6Ready=false;v6Starting=false;
+  }
+  function v6Save(){
+    if(!FIREBASE_ENABLED||isRemoteUpdate||!db||!v6Ready)return;
+    clearTimeout(v6Timer);
+    v6Timer=setTimeout(function(){
+      var changes=v6Dirty(db),keys=Object.keys(changes);
+      if(!keys.length)return;
+      v6BatchWrite(changes).then(function(){
+        keys.forEach(function(k){
+          var e=changes[k];
+          if(e&&e.deleted)delete v6Shadow[k];
+          else v6Shadow[k]=v6Json(e.data);
+        });
+        syncBadge('on');
+      }).catch(function(){syncBadge('off')});
+    },450);
+  }
+  /* Replace the old whole-company-document sync with per-record sync. */
+  window.cloudSave=v6Save;cloudSave=v6Save;
+  window.startCloudSync=v6Start;startCloudSync=v6Start;
+  window.stopCloudSync=v6Stop;stopCloudSync=v6Stop;
+
+  /* ---------- employee master data ---------- */
+  var oldMigrate=migrate;
+  window.migrate=function(){
+    oldMigrate.apply(this,arguments);
+    if(!db.employees)db.employees=[];
+    db.employees.forEach(function(e){
+      if(e.active===undefined)e.active=true;
+      if(e.payType===undefined)e.payType='MONTHLY';
+      if(e.payRate===undefined)e.payRate=0;
+    });
+    var known={};
+    db.employees.forEach(function(e){if(e.name)known[e.name]=1});
+    (db.comms||[]).concat(db.sales||[]).forEach(function(x){
+      var name=x&&x.emp;
+      if(name&&!known[name]){
+        db.employees.push({id:uid(),name:name,code:'',phone:'',active:true,
+          payType:'MONTHLY',payRate:0,at:NOW(),uid:me&&me.id});
+        known[name]=1;
+      }
+    });
+  };
+  migrate=window.migrate;
+  PERM['emp.read']=['OWNER','ACCOUNTING'];
+  PERM['emp.write']=['OWNER','ACCOUNTING'];
+  function employeeById(id){
+    for(var i=0;i<(db.employees||[]).length;i++)if(db.employees[i].id===id)return db.employees[i];
+    return null;
+  }
+  function employeeByName(name){
+    for(var i=0;i<(db.employees||[]).length;i++)
+      if(db.employees[i].name===name)return db.employees[i];
+    return null;
+  }
+  var baseEmpList=empList;
+  function employeeNames(){
+    var m={},i;
+    (db.employees||[]).forEach(function(e){if(e.active!==false)m[e.name]=1});
+    baseEmpList().forEach(function(e){m[e]=1});
+    return Object.keys(m).sort();
+  }
+  function employeeWorkedDays(name,ym){
+    var m={};
+    db.sales.filter(function(s){return s.status==='POSTED'&&s.emp===name&&DAY(s.at).slice(0,7)===ym})
+      .forEach(function(s){m[DAY(s.at)]=1});
+    return Object.keys(m).length;
+  }
+  function employeeBasePay(e,ym){
+    if(!e)return 0;
+    var rate=Number(e.payRate)||0;
+    if(e.payType==='DAILY')return r2(rate*employeeWorkedDays(e.name,ym));
+    if(e.payType==='FIXED')return rate;
+    return rate;
+  }
+  function employeePayTypeLabel(t){
+    return t==='DAILY'?'รายวัน':(t==='FIXED'?'เหมาจ่าย':'รายเดือน');
+  }
+  window.mEmployee=function(id){
+    need('emp.write');
+    var e=employeeById(id),o=e||{name:'',code:'',phone:'',payType:'MONTHLY',payRate:0,active:true};
+    modal(e?'แก้ไขข้อมูลพนักงาน':'เพิ่มพนักงาน',
+      '<div class="grid g2"><div><label>รหัสพนักงาน</label><input id="empc" value="'+E(o.code||'')+'" placeholder="เช่น EMP-001"></div>'+
+      '<div><label>สถานะ</label><select id="empa"><option value="1"'+(o.active!==false?' selected':'')+'>ทำงาน</option><option value="0"'+(o.active===false?' selected':'')+'>พักงาน</option></select></div></div>'+
+      '<label>ชื่อพนักงาน</label><input id="empname" value="'+E(o.name||'')+'" placeholder="ชื่อ-นามสกุล">'+
+      '<label>โทรศัพท์</label><input id="empph" value="'+E(o.phone||'')+'" placeholder="ถ้ามี">'+
+      '<div class="grid g2"><div><label>รูปแบบค่าจ้าง</label><select id="empt"><option value="MONTHLY"'+(o.payType==='MONTHLY'?' selected':'')+'>รายเดือน</option><option value="DAILY"'+(o.payType==='DAILY'?' selected':'')+'>รายวัน</option><option value="FIXED"'+(o.payType==='FIXED'?' selected':'')+'>เหมาจ่าย</option></select></div>'+
+      '<div><label>อัตราค่าจ้าง (บาท)</label><input id="empr" type="number" min="0" step="0.01" value="'+(o.payRate||0)+'"></div></div>'+
+      '<p class="mu" style="margin-top:8px">ค่าคอมมิชชั่นจากสินค้าแสดงแยกต่างหากในตารางด้านล่าง</p>',
+      function(){
+        var name=V('empname'),code=V('empc'),rate=Math.max(0,N('empr'));
+        var isNew=!e;
+        if(!name)throw new Error('กรุณากรอกชื่อพนักงาน');
+        if(!e){e={id:uid(),at:NOW(),uid:me.id};db.employees.push(e)}
+        e.name=name;e.code=code;e.phone=V('empph');e.payType=V('empt');e.payRate=rate;e.active=V('empa')==='1';
+        audit(isNew?'CREATE_EMPLOYEE':'UPDATE_EMPLOYEE','employees',e.id,null,{name:name,payType:e.payType,payRate:rate});
+        save();shut();toast('บันทึกข้อมูลพนักงานแล้ว');render();
+      },'บันทึกข้อมูล');
+  };
+  function employeePanel(){
+    if(!can('emp.read'))return '';
+    var ym=DAY().slice(0,7),list=db.employees||[],h=[];
+    h.push('<div class="card"><h2>👷 ทะเบียนพนักงาน <span class="sp"></span>'+
+      (can('emp.write')?'<button class="btn sm" onclick="mEmployee()">＋ เพิ่มพนักงาน</button>':'')+'</h2>'+
+      '<p class="mu">กำหนดค่าจ้างพื้นฐานแยกรายคน ส่วนค่าคอมมิชชั่นจากการขายยังคำนวณแยกตามสินค้า</p>'+
+      '<div class="tw"><table><thead><tr><th>รหัส</th><th>พนักงาน</th><th>รูปแบบ</th><th class="num">ค่าจ้างพื้นฐาน</th><th class="num">คอมค้าง</th><th class="num">รวมประมาณเดือนนี้</th><th></th></tr></thead><tbody>');
+    if(list.length)list.forEach(function(e){
+      var base=employeeBasePay(e,ym),due=commDue(e.name);
+      h.push('<tr'+(e.active===false?' style="opacity:.5"':'')+'><td>'+E(e.code||'-')+'</td><td><b>'+E(e.name)+'</b><div class="mu">'+E(e.phone||'')+'</div></td>'+
+        '<td>'+employeePayTypeLabel(e.payType)+'</td><td class="num">'+B(e.payRate||0)+'</td><td class="num" style="color:var(--rd)">'+B(due)+'</td>'+
+        '<td class="num" style="font-weight:700">'+B(base+due)+'</td><td>'+(can('emp.write')?'<button class="btn o xs" onclick="mEmployee(\''+e.id+'\')">แก้</button>':'')+'</td></tr>');
+    });
+    if(!list.length)h.push('<tr><td colspan="7" class="emp">ยังไม่มีทะเบียนพนักงาน กดเพิ่มพนักงานเพื่อเริ่มบันทึกค่าจ้าง</td></tr>');
+    return h.join('')+'</tbody></table></div></div>';
+  }
+  if(typeof VIEWS!=='undefined'&&VIEWS.comm){
+    var oldComm=VIEWS.comm;
+    VIEWS.comm=function(){return employeePanel()+oldComm.apply(this,arguments)};
+  }
+  if(typeof empList==='function'){
+    var oldEmpList=empList;
+    window.empList=function(){return employeeNames()};
+    empList=window.empList;
+  }
+  setTimeout(function(){
+    try{
+      clearTimeout(cloudSaveTimer);
+      cloudSaveTimer=null;
+      if(window.db){
+        migrate();
+        if(v6CloudAvailable&&FIREBASE_ENABLED)v6Start();
+        if($('app')&&!$('app').classList.contains('hide'))render();
+      }
+    }catch(e){}
+  },250);
+  console.log('%c✅ v6.0 isolated records + employee pay register loaded','color:#059669;font-weight:bold');
+})();
+</script>
+
 </body>
 </html>
